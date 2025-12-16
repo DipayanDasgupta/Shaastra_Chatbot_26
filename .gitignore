@@ -1,0 +1,15 @@
+# Ignore system files
+__pycache__/
+*.pyc
+*.ds_store
+venv/
+.env
+
+# Ignore the experimental databases in the root (Keep the one inside the module)
+chroma_db_final/
+chroma_db_hierarchical/
+chroma_db_md/
+
+# Ignore the experimental scripts in the root
+*.py
+!shaastra_chatbot/**/*.py  # Do NOT ignore python files inside our target folder
