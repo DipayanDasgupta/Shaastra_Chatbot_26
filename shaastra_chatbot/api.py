@@ -1,87 +1,141 @@
 import config
-from fastapi import FastAPI, HTTPException
+import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+import shutil
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from contextlib import asynccontextmanager # <--- NEW IMPORT
-# Import components only when needed or keep global if preferred
-from components import context, llm, retriever, knowledge_graph, rewriter_chain 
+from contextlib import asynccontextmanager
 from graph import build_graph
+from audio_engine import AudioEngine
 
-# --- LIFESPAN MANAGER (Fixes Warning) ---
+# --- GLOBAL COMPONENTS ---
+audio_engine = None
+bot_app = None
+SESSION_MEMORY = {}
+
+# --- LIFESPAN MANAGER ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup logic
-    print("🚀 API Starting... Loading Models...")
-    # You can force model load here if lazy loading is preferred
-    print("✅ Models Ready. API is listening.")
+    global bot_app, audio_engine
+    print("🚀 API Starting... Loading AI Models...")
+    
+    # 1. Load RAG Graph (LLM + Retrievers)
+    # Trigger imports in components to load models
+    import components 
+    bot_app = build_graph()
+    
+    # 2. Load Audio Engine (Whisper + Parler)
+    audio_engine = AudioEngine()
+    
+    print("✅ All Models Ready. API is listening.")
     yield
-    # Shutdown logic (optional: clear VRAM)
     print("🛑 API Shutting down.")
 
-# Initialize API with lifespan
-app = FastAPI(title="Shaastra 2025 RAG API", lifespan=lifespan)
+app = FastAPI(title="Shaastra 2025 Multimodal API", lifespan=lifespan)
 
-# Initialize Graph
-bot_app = build_graph()
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Global Memory
-SESSION_MEMORY = {
-    "default": {
-        "history": [],
-        "summary": ""
-    }
-}
-
+# --- DATA MODELS ---
 class ChatRequest(BaseModel):
     user_id: str = "default"
     text: str
 
 class ChatResponse(BaseModel):
-    response: str
+    text_response: str
+    audio_base64: str = None
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
-    user_id = request.user_id
-    query = request.text
-    
-    # Init session if new
+# --- CORE LOGIC ---
+def process_query(user_id, query):
     if user_id not in SESSION_MEMORY:
         SESSION_MEMORY[user_id] = {"history": [], "summary": ""}
-        
+    
     user_state = SESSION_MEMORY[user_id]
     
+    inputs = {
+        "question": query,
+        "chat_history": user_state["history"],
+        "summary": user_state["summary"]
+    }
+    
+    result = bot_app.invoke(inputs)
+    ans = result['generation']
+    
+    if "Answer:" in ans: ans = ans.split("Answer:")[-1].strip()
+    
+    # Update Memory
+    new_history = result.get('chat_history', [])
+    new_history.append(f"User: {query}")
+    new_history.append(f"AI: {ans}")
+    
+    SESSION_MEMORY[user_id]["history"] = new_history
+    SESSION_MEMORY[user_id]["summary"] = result.get("summary", user_state["summary"])
+    
+    return ans
+
+# --- ENDPOINTS ---
+
+@app.post("/chat/text", response_model=ChatResponse)
+async def chat_text_endpoint(request: ChatRequest):
+    """Text In -> Text Out"""
     try:
-        inputs = {
-            "question": query,
-            "chat_history": user_state["history"],
-            "summary": user_state["summary"]
+        response_text = process_query(request.user_id, request.text)
+        return ChatResponse(text_response=response_text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/chat/audio")
+async def chat_audio_endpoint(
+    user_id: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """Audio In -> Audio + Text Out"""
+    try:
+        # 1. Save uploaded audio
+        temp_filename = f"{user_id}_input.wav"
+        temp_path = config.AUDIO_DIR / temp_filename
+        
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # 2. Speech to Text (Faster Whisper)
+        print(f"🎤 Transcribing audio for {user_id}...")
+        transcribed_text = audio_engine.speech_to_text(str(temp_path))
+        print(f"🗣️ User said: {transcribed_text}")
+        
+        if not transcribed_text:
+            return {"text_response": "I couldn't hear anything.", "audio_base64": None}
+
+        # 3. Process RAG (LLM)
+        response_text = process_query(user_id, transcribed_text)
+        print(f"🤖 AI Text: {response_text}")
+        
+        # 4. Text to Speech (Parler TTS)
+        print(f"🔊 Generating audio response...")
+        output_audio_path = config.AUDIO_DIR / f"{user_id}_response.wav"
+        
+        # We limit text sent to TTS to avoid OOM on very long RAG answers
+        tts_text = response_text[:500] # Parler can be memory hungry
+        audio_engine.text_to_speech(tts_text, str(output_audio_path))
+        
+        # 5. Return
+        audio_b64 = audio_engine.audio_file_to_base64(output_audio_path)
+        
+        return {
+            "user_query": transcribed_text,
+            "text_response": response_text,
+            "audio_base64": audio_b64
         }
-        
-        result = bot_app.invoke(inputs)
-        ans = result['generation']
-        
-        # Clean specific CoT artifacts if any remain
-        if "Answer:" in ans:
-            ans = ans.split("Answer:")[-1].strip()
-
-        # Update Memory
-        new_history = result.get('chat_history', user_state["history"])
-        # Append new turn
-        new_history.append(f"User: {query}")
-        new_history.append(f"AI: {ans}")
-        
-        # Keep sliding window in session
-        if len(new_history) > 6:
-            new_history = new_history[-6:]
-
-        SESSION_MEMORY[user_id]["history"] = new_history
-        SESSION_MEMORY[user_id]["summary"] = result.get("summary", "")
-        
-        return ChatResponse(response=ans)
 
     except Exception as e:
         print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
